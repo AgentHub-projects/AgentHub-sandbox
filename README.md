@@ -1,0 +1,227 @@
+# AgentHub Sandbox
+
+`AgentHub-sandbox` 是一个单 session 的 Go 沙箱服务，负责为 `leader` / `worker-*` 提供：
+
+- 基于 Socket.IO 的文件实时读写
+- 基于 Socket.IO 的命令执行与文件访问
+- 基于 HTTP 的 git worktree / branch / merge / promote 编排
+
+## 设计约束
+
+- sandbox 不再接收 `sessionId`
+- sandbox 不再要求外部传 `worktreeId`
+- 内部只维护 `agentId -> WorktreeState` 的内存映射
+- `/filesystem/socket.io` 与 `/agents/socket.io` 强制走 websocket transport
+- `/git` 只提供编排能力，是否并入 `main` 由 leader 决定
+
+## 配置
+
+环境变量：
+
+- `HOST`，默认 `0.0.0.0`
+- `PORT`，默认 `8080`
+- `REPO_ROOT`，默认 `/workspace/repo`
+- `WORKTREE_ROOT`，默认 `/workspace-worktrees`
+
+## HTTP 接口
+
+### `GET /health`
+
+返回：
+
+```text
+ok
+```
+
+### `POST /execute`
+
+请求头优先读取 `X-AgentHub-Agent-Id`，兼容 query `agentId`。
+
+请求：
+
+```json
+{
+  "command": "go test ./..."
+}
+```
+
+返回：
+
+```json
+{
+  "stdout": "",
+  "stderr": "",
+  "exit_code": 0
+}
+```
+
+### `GET /download/*path`
+
+请求头优先读取 `X-AgentHub-Agent-Id`，兼容 query `agentId`。
+
+返回文件原文。
+
+### `GET /git/agents`
+
+返回所有已 prepare 的 agent：
+
+```json
+{
+  "items": [
+    {
+      "agentId": "leader",
+      "branchName": "agent/leader",
+      "rootPath": "/workspace-worktrees/leader",
+      "headSha": "abc123",
+      "preparedAt": "2026-05-27T12:00:00Z"
+    }
+  ]
+}
+```
+
+### `POST /git/agents/{agentId}/prepare`
+
+请求：
+
+```json
+{
+  "fromRef": "main",
+  "branchName": "agent/worker-1",
+  "reset": true
+}
+```
+
+### `GET /git/agents/{agentId}/status`
+
+返回 branch、head、staged、unstaged、untracked、conflicted。
+
+### `GET /git/agents/{agentId}/diff?base=main`
+
+返回文件级 diff 摘要和 patch。
+
+### `POST /git/agents/{agentId}/commit`
+
+请求：
+
+```json
+{
+  "message": "worker change",
+  "authorName": "AgentHub Worker",
+  "authorEmail": "worker@agenthub.local"
+}
+```
+
+### `POST /git/agents/{agentId}/merge`
+
+请求：
+
+```json
+{
+  "sourceAgentId": "worker-1",
+  "noFF": false
+}
+```
+
+语义：把 `sourceAgentId` 的 branch merge 到目标 agent 当前 worktree。
+
+### `POST /git/agents/{agentId}/merge/abort`
+
+返回：
+
+```json
+{
+  "ok": true
+}
+```
+
+### `POST /git/agents/{agentId}/promote`
+
+请求：
+
+```json
+{
+  "targetBranch": "main",
+  "noFF": false
+}
+```
+
+### `DELETE /git/agents/{agentId}/worktree`
+
+删除 worktree 并从内存映射移除。
+
+## Socket.IO
+
+两个 socket path：
+
+- `/filesystem/socket.io`
+- `/agents/socket.io`
+
+连接参数：
+
+- `auth.agentId`，推荐
+- `query.agentId`，兼容
+
+通用 ack 返回：
+
+```json
+{
+  "requestId": "req-1",
+  "ok": true,
+  "data": {}
+}
+```
+
+错误返回：
+
+```json
+{
+  "requestId": "req-1",
+  "ok": false,
+  "error": {
+    "code": "WORKTREE_NOT_PREPARED",
+    "message": "agent worktree is not prepared"
+  }
+}
+```
+
+### `/filesystem/socket.io`
+
+- `fs:info`
+- `fs:list`
+- `fs:read`
+- `fs:write`
+- `fs:watch`
+- `fs:unwatch`
+- 服务端推送 `fs:changed`
+
+### `/agents/socket.io`
+
+- `agent:info`
+- `exec:start`
+- `exec:stdin`
+- `exec:kill`
+- `file:read`
+- `file:write`
+- 服务端推送 `exec:stdout`
+- 服务端推送 `exec:stderr`
+- 服务端推送 `exec:exit`
+- 服务端推送 `exec:error`
+
+## 内部模块
+
+- `cmd/sandbox/main.go`：启动入口
+- `internal/app`：装配所有模块
+- `internal/worktree`：维护 `agentId -> WorktreeState`
+- `internal/filesystem`：安全读写、版本戳、watch 广播
+- `internal/executor`：命令执行、stdout/stderr 流式回传、kill/timeout
+- `internal/gitmgr`：git worktree / status / diff / commit / merge / promote
+- `internal/transport/httpapi`：HTTP 路由
+- `internal/transport/socketio`：Socket.IO 事件
+- `internal/security`：路径归一化和 worktree 越界保护
+
+## 本地运行
+
+```bash
+go test ./...
+go run ./cmd/sandbox
+```
