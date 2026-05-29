@@ -45,6 +45,7 @@ type Service struct {
 	agentRoots     map[string]string
 	watchedByAgent map[string]map[string]struct{}
 	recent         map[string]time.Time
+	ensureAgent    func(agentID string) error
 }
 
 // Service 负责 worktree 内的安全读写、目录监听和变更广播。
@@ -72,6 +73,10 @@ func (s *Service) Close() error {
 
 func (s *Service) Hub() *watcher.Hub {
 	return s.hub
+}
+
+func (s *Service) SetEnsureAgent(ensure func(agentID string) error) {
+	s.ensureAgent = ensure
 }
 
 // SyncAgent 会把某个 agent 的整个 worktree 目录树挂到 fsnotify 上。
@@ -126,7 +131,7 @@ func (s *Service) RemoveAgent(agentID string) error {
 }
 
 func (s *Service) Info(agentID string) (domain.WorktreeInfo, error) {
-	state, err := s.registry.MustGet(agentID)
+	state, err := s.state(agentID)
 	if err != nil {
 		return domain.WorktreeInfo{}, err
 	}
@@ -135,7 +140,7 @@ func (s *Service) Info(agentID string) (domain.WorktreeInfo, error) {
 
 // List 用来给前端代码树展示目录和文件信息。
 func (s *Service) List(agentID, rawPath string, depth int) ([]domain.FileEntry, error) {
-	state, err := s.registry.MustGet(agentID)
+	state, err := s.state(agentID)
 	if err != nil {
 		return nil, err
 	}
@@ -195,7 +200,7 @@ func (s *Service) List(agentID, rawPath string, depth int) ([]domain.FileEntry, 
 
 // Read 支持整文件读取，也支持按行裁剪返回。
 func (s *Service) Read(agentID, rawPath string, lineStart, lineEnd int) (ReadResult, error) {
-	state, err := s.registry.MustGet(agentID)
+	state, err := s.state(agentID)
 	if err != nil {
 		return ReadResult{}, err
 	}
@@ -225,7 +230,7 @@ func (s *Service) Read(agentID, rawPath string, lineStart, lineEnd int) (ReadRes
 
 // Write 会校验版本、限制路径，并在写盘后主动广播变更事件。
 func (s *Service) Write(agentID, rawPath, content, expectedVersion string, createDirs bool, actor string) (WriteResult, error) {
-	state, err := s.registry.MustGet(agentID)
+	state, err := s.state(agentID)
 	if err != nil {
 		return WriteResult{}, err
 	}
@@ -297,6 +302,32 @@ func (s *Service) NotifyChange(agentID, relPath, changeType, actor string) {
 		Version:    version,
 		Actor:      actor,
 	})
+}
+
+func (s *Service) state(agentID string) (*worktree.State, error) {
+	state, err := s.registry.MustGet(agentID)
+	if err == nil {
+		if s.ensureAgent != nil && !s.isSynced(agentID) {
+			if err := s.ensureAgent(agentID); err != nil {
+				return nil, err
+			}
+			return s.registry.MustGet(agentID)
+		}
+		return state, nil
+	}
+	if !errors.Is(err, domain.ErrWorktreeNotPrepared) || s.ensureAgent == nil {
+		return nil, err
+	}
+	if err := s.ensureAgent(agentID); err != nil {
+		return nil, err
+	}
+	return s.registry.MustGet(agentID)
+}
+
+func (s *Service) isSynced(agentID string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.agentRoots[agentID] != ""
 }
 
 // loop 持续消费 fsnotify 事件并转发成 sandbox 内部的文件变更消息。

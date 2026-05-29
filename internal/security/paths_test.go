@@ -62,7 +62,11 @@ func TestResolveForWrite(t *testing.T) {
 		t.Fatalf("expected relative path nested/file.txt, got %s", rel)
 	}
 
-	want := filepath.Join(root, "nested", "file.txt")
+	rootReal, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		t.Fatalf("resolve temp root: %v", err)
+	}
+	want := filepath.Join(rootReal, "nested", "file.txt")
 	if filepath.Clean(resolved) != filepath.Clean(want) {
 		t.Fatalf("expected resolved path %s, got %s", want, resolved)
 	}

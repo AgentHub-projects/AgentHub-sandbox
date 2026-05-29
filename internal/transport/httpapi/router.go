@@ -31,10 +31,10 @@ func (r *Router) Register(mux *http.ServeMux) {
 	mux.HandleFunc("POST /execute", r.handleExecute)
 	mux.HandleFunc("/download/", r.handleDownload)
 	mux.HandleFunc("GET /git/agents", r.handleListAgents)
-	mux.HandleFunc("POST /git/agents/{agentId}/prepare", r.handlePrepare)
 	mux.HandleFunc("GET /git/agents/{agentId}/status", r.handleStatus)
 	mux.HandleFunc("GET /git/agents/{agentId}/diff", r.handleDiff)
-	mux.HandleFunc("POST /git/agents/{agentId}/commit", r.handleCommit)
+	mux.HandleFunc("POST /git/agents/{agentId}/complete", r.handleComplete)
+	mux.HandleFunc("POST /git/agents/{agentId}/sync", r.handleSync)
 	mux.HandleFunc("POST /git/agents/{agentId}/merge", r.handleMerge)
 	mux.HandleFunc("POST /git/agents/{agentId}/merge/abort", r.handleAbortMerge)
 	mux.HandleFunc("POST /git/agents/{agentId}/promote", r.handlePromote)
@@ -101,27 +101,6 @@ func (r *Router) handleListAgents(w http.ResponseWriter, _ *http.Request) {
 	})
 }
 
-// prepare 成功后要立即把新的 worktree 同步到文件监听器里。
-func (r *Router) handlePrepare(w http.ResponseWriter, req *http.Request) {
-	agentID := req.PathValue("agentId")
-	var body gitmgr.PrepareRequest
-	if err := readJSON(req, &body); err != nil {
-		writeError(w, err)
-		return
-	}
-	info, err := r.git.Prepare(agentID, body)
-	if err != nil {
-		writeError(w, err)
-		return
-	}
-	if err := r.fs.SyncAgent(agentID); err != nil {
-		_ = r.git.DeleteWorktree(agentID)
-		writeError(w, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, info)
-}
-
 func (r *Router) handleStatus(w http.ResponseWriter, req *http.Request) {
 	status, err := r.git.Status(req.PathValue("agentId"))
 	if err != nil {
@@ -140,21 +119,18 @@ func (r *Router) handleDiff(w http.ResponseWriter, req *http.Request) {
 	writeJSON(w, http.StatusOK, diff)
 }
 
-func (r *Router) handleCommit(w http.ResponseWriter, req *http.Request) {
-	var body gitmgr.CommitRequest
+func (r *Router) handleComplete(w http.ResponseWriter, req *http.Request) {
+	var body gitmgr.CompleteRequest
 	if err := readJSON(req, &body); err != nil {
 		writeError(w, err)
 		return
 	}
-	branchName, commitSHA, err := r.git.Commit(req.PathValue("agentId"), body)
+	result, err := r.git.Complete(req.PathValue("agentId"), body)
 	if err != nil {
 		writeError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"branchName": branchName,
-		"commitSha":  commitSHA,
-	})
+	writeJSON(w, http.StatusOK, result)
 }
 
 func (r *Router) handleMerge(w http.ResponseWriter, req *http.Request) {
@@ -164,6 +140,20 @@ func (r *Router) handleMerge(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	result, err := r.git.Merge(req.PathValue("agentId"), body)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+func (r *Router) handleSync(w http.ResponseWriter, req *http.Request) {
+	var body gitmgr.SyncRequest
+	if err := readJSON(req, &body); err != nil {
+		writeError(w, err)
+		return
+	}
+	result, err := r.git.Sync(req.PathValue("agentId"), body)
 	if err != nil {
 		writeError(w, err)
 		return
@@ -249,7 +239,7 @@ func writeError(w http.ResponseWriter, err error) {
 	case errors.Is(err, domain.ErrWorktreeNotPrepared), errors.Is(err, domain.ErrExecNotFound):
 		status = http.StatusNotFound
 		code = "NOT_FOUND"
-	case errors.Is(err, domain.ErrVersionConflict), errors.Is(err, domain.ErrGitNoChanges):
+	case errors.Is(err, domain.ErrVersionConflict), errors.Is(err, domain.ErrGitNoChanges), errors.Is(err, domain.ErrMergeConflict):
 		status = http.StatusConflict
 		code = "CONFLICT"
 	}

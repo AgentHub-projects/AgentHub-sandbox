@@ -32,14 +32,31 @@ type CommitRequest struct {
 	AuthorEmail string `json:"authorEmail"`
 }
 
+type CompleteRequest struct {
+	Message     string `json:"message"`
+	AuthorName  string `json:"authorName"`
+	AuthorEmail string `json:"authorEmail"`
+}
+
 type MergeRequest struct {
 	SourceAgentID string `json:"sourceAgentId"`
 	NoFF          bool   `json:"noFF"`
 }
 
+type SyncRequest struct {
+	FromRef string `json:"fromRef"`
+	NoFF    bool   `json:"noFF"`
+}
+
 type PromoteRequest struct {
 	TargetBranch string `json:"targetBranch"`
 	NoFF         bool   `json:"noFF"`
+}
+
+type gitWorktreeEntry struct {
+	Path       string
+	HeadSHA    string
+	BranchName string
 }
 
 type Manager struct {
@@ -71,7 +88,37 @@ func (m *Manager) ListAgents() []domain.WorktreeInfo {
 	return items
 }
 
-// Prepare 是注册 agent worktree 的唯一入口。
+// RestoreWorktrees 从 Git 自身的 worktree 元数据恢复内存 registry。
+func (m *Manager) RestoreWorktrees() ([]domain.WorktreeInfo, error) {
+	ok, err := m.isGitRepo()
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return []domain.WorktreeInfo{}, nil
+	}
+
+	stdout, err := m.git(m.repoRoot, nil, "worktree", "list", "--porcelain")
+	if err != nil {
+		return nil, err
+	}
+	for _, entry := range parseGitWorktreeList(stdout) {
+		state, ok := m.stateFromGitWorktree(entry)
+		if !ok {
+			continue
+		}
+		m.registry.Upsert(state)
+	}
+	return m.ListAgents(), nil
+}
+
+// Ensure lazily creates and registers an agent worktree when the first
+// workspace operation arrives for that agent.
+func (m *Manager) Ensure(agentID string) (domain.WorktreeInfo, error) {
+	return m.Prepare(agentID, PrepareRequest{})
+}
+
+// Prepare 是兼容显式重置/指定来源的管理入口；常规调用应走 Ensure 懒加载。
 func (m *Manager) Prepare(agentID string, req PrepareRequest) (domain.WorktreeInfo, error) {
 	if err := validateAgentID(agentID); err != nil {
 		return domain.WorktreeInfo{}, err
@@ -81,6 +128,9 @@ func (m *Manager) Prepare(agentID string, req PrepareRequest) (domain.WorktreeIn
 	}
 	if req.BranchName == "" {
 		req.BranchName = defaultBranchName(agentID)
+	}
+	if err := m.ensureRepoReady(); err != nil {
+		return domain.WorktreeInfo{}, err
 	}
 
 	rootPath := m.worktreePath(agentID)
@@ -130,7 +180,7 @@ func (m *Manager) Prepare(agentID string, req PrepareRequest) (domain.WorktreeIn
 }
 
 func (m *Manager) Status(agentID string) (domain.StatusSummary, error) {
-	state, err := m.registry.MustGet(agentID)
+	state, err := m.ensureState(agentID)
 	if err != nil {
 		return domain.StatusSummary{}, err
 	}
@@ -151,7 +201,7 @@ func (m *Manager) Status(agentID string) (domain.StatusSummary, error) {
 
 // Diff 返回给 leader 用的文件摘要和完整 patch。
 func (m *Manager) Diff(agentID, baseRef string) (domain.DiffSummary, error) {
-	state, err := m.registry.MustGet(agentID)
+	state, err := m.ensureState(agentID)
 	if err != nil {
 		return domain.DiffSummary{}, err
 	}
@@ -188,7 +238,7 @@ func (m *Manager) Diff(agentID, baseRef string) (domain.DiffSummary, error) {
 
 // Commit 会先 add 全量改动，再创建一次本地提交。
 func (m *Manager) Commit(agentID string, req CommitRequest) (branchName string, commitSHA string, err error) {
-	state, err := m.registry.MustGet(agentID)
+	state, err := m.ensureState(agentID)
 	if err != nil {
 		return "", "", err
 	}
@@ -207,12 +257,7 @@ func (m *Manager) Commit(agentID string, req CommitRequest) (branchName string, 
 		return "", "", domain.ErrGitNoChanges
 	}
 
-	env := map[string]string{
-		"GIT_AUTHOR_NAME":     defaultString(req.AuthorName, "AgentHub Sandbox"),
-		"GIT_AUTHOR_EMAIL":    defaultString(req.AuthorEmail, "sandbox@agenthub.local"),
-		"GIT_COMMITTER_NAME":  defaultString(req.AuthorName, "AgentHub Sandbox"),
-		"GIT_COMMITTER_EMAIL": defaultString(req.AuthorEmail, "sandbox@agenthub.local"),
-	}
+	env := gitIdentityEnv(req.AuthorName, req.AuthorEmail)
 	if _, err := m.git(state.RootPath, env, "commit", "-m", req.Message); err != nil {
 		return "", "", err
 	}
@@ -225,13 +270,63 @@ func (m *Manager) Commit(agentID string, req CommitRequest) (branchName string, 
 	return state.BranchName, commitSHA, nil
 }
 
+// Complete 把 agent 完成时的未提交变更收口到它自己的分支。
+func (m *Manager) Complete(agentID string, req CompleteRequest) (domain.AgentCompletionResult, error) {
+	status, err := m.Status(agentID)
+	if err != nil {
+		return domain.AgentCompletionResult{}, err
+	}
+	result := domain.AgentCompletionResult{
+		Status:     "clean",
+		BranchName: status.BranchName,
+		HeadSHA:    status.HeadSHA,
+		Staged:     status.Staged,
+		Unstaged:   status.Unstaged,
+		Untracked:  status.Untracked,
+		Conflicted: status.Conflicted,
+	}
+	if len(status.Conflicted) > 0 {
+		result.Status = "conflicted"
+		return result, fmt.Errorf("%w: %s", domain.ErrMergeConflict, strings.Join(status.Conflicted, ", "))
+	}
+	if len(status.Staged) == 0 && len(status.Unstaged) == 0 && len(status.Untracked) == 0 {
+		return result, nil
+	}
+
+	message := strings.TrimSpace(req.Message)
+	if message == "" {
+		message = fmt.Sprintf("agent(%s): complete work", agentID)
+	}
+	branchName, commitSHA, err := m.Commit(agentID, CommitRequest{
+		Message:     message,
+		AuthorName:  req.AuthorName,
+		AuthorEmail: req.AuthorEmail,
+	})
+	if err != nil {
+		return domain.AgentCompletionResult{}, err
+	}
+	headSHA, err := m.revParse(m.worktreePath(agentID), "HEAD")
+	if err != nil {
+		return domain.AgentCompletionResult{}, err
+	}
+	return domain.AgentCompletionResult{
+		Status:     "committed",
+		BranchName: branchName,
+		HeadSHA:    headSHA,
+		CommitSHA:  commitSHA,
+		Staged:     status.Staged,
+		Unstaged:   status.Unstaged,
+		Untracked:  status.Untracked,
+	}, nil
+}
+
 // Merge 把 source agent 分支并到 target agent 的 worktree 里。
 func (m *Manager) Merge(targetAgentID string, req MergeRequest) (domain.MergeResult, error) {
-	target, err := m.registry.MustGet(targetAgentID)
+	target, err := m.ensureState(targetAgentID)
 	if err != nil {
 		return domain.MergeResult{}, err
 	}
-	source, err := m.registry.MustGet(req.SourceAgentID)
+	source, err := m.ensureState(req.SourceAgentID)
 	if err != nil {
 		return domain.MergeResult{}, err
 	}
@@ -242,7 +337,7 @@ func (m *Manager) Merge(targetAgentID string, req MergeRequest) (domain.MergeRes
 	}
 	args = append(args, source.BranchName, "-m", fmt.Sprintf("merge %s into %s", source.BranchName, target.BranchName))
 
-	_, mergeErr := m.git(target.RootPath, nil, args...)
+	_, mergeErr := m.git(target.RootPath, gitIdentityEnv("", ""), args...)
 	if mergeErr != nil {
 		status, statusErr := m.Status(targetAgentID)
 		if statusErr == nil && len(status.Conflicted) > 0 {
@@ -281,7 +376,7 @@ func (m *Manager) Merge(targetAgentID string, req MergeRequest) (domain.MergeRes
 }
 
 func (m *Manager) AbortMerge(agentID string) error {
-	state, err := m.registry.MustGet(agentID)
+	state, err := m.ensureState(agentID)
 	if err != nil {
 		return err
 	}
@@ -295,9 +390,86 @@ func (m *Manager) AbortMerge(agentID string) error {
 	return nil
 }
 
+// Sync 把主仓库里的目标 ref 合入某个 agent 自己的 worktree。
+func (m *Manager) Sync(agentID string, req SyncRequest) (domain.SyncResult, error) {
+	state, err := m.ensureState(agentID)
+	if err != nil {
+		return domain.SyncResult{}, err
+	}
+	fromRef := strings.TrimSpace(req.FromRef)
+	if fromRef == "" {
+		fromRef = "main"
+	}
+
+	before, err := m.Status(agentID)
+	if err != nil {
+		return domain.SyncResult{}, err
+	}
+	if dirty := dirtyPaths(before); len(dirty) > 0 {
+		return domain.SyncResult{
+			Status:       "dirty",
+			SourceRef:    fromRef,
+			TargetBranch: state.BranchName,
+			HeadSHA:      before.HeadSHA,
+			Dirty:        dirty,
+			Conflicted:   before.Conflicted,
+		}, nil
+	}
+
+	args := []string{"merge"}
+	if req.NoFF {
+		args = append(args, "--no-ff")
+	}
+	args = append(args, fromRef, "-m", fmt.Sprintf("sync %s into %s", fromRef, state.BranchName))
+
+	_, mergeErr := m.git(state.RootPath, gitIdentityEnv("", ""), args...)
+	if mergeErr != nil {
+		status, statusErr := m.Status(agentID)
+		if statusErr == nil && len(status.Conflicted) > 0 {
+			for _, conflicted := range status.Conflicted {
+				m.notify(agentID, conflicted, "write", "git")
+			}
+			return domain.SyncResult{
+				Status:       "conflicted",
+				SourceRef:    fromRef,
+				TargetBranch: state.BranchName,
+				HeadSHA:      status.HeadSHA,
+				Conflicted:   status.Conflicted,
+			}, nil
+		}
+		return domain.SyncResult{}, mergeErr
+	}
+
+	headSHA, err := m.revParse(state.RootPath, "HEAD")
+	if err != nil {
+		return domain.SyncResult{}, err
+	}
+	m.registry.UpdateHead(agentID, headSHA)
+	if before.HeadSHA != "" && before.HeadSHA != headSHA {
+		changed, changedErr := m.git(state.RootPath, nil, "diff", "--name-only", before.HeadSHA, headSHA)
+		if changedErr == nil {
+			for _, relPath := range splitLines(changed) {
+				m.notify(agentID, relPath, "write", "git")
+			}
+		}
+	}
+
+	status := "synced"
+	if before.HeadSHA == headSHA {
+		status = "up_to_date"
+	}
+	return domain.SyncResult{
+		Status:         status,
+		SourceRef:      fromRef,
+		TargetBranch:   state.BranchName,
+		HeadSHA:        headSHA,
+		MergeCommitSHA: headSHA,
+	}, nil
+}
+
 // Promote 把某个 agent 分支最终并到主仓库的目标分支里。
 func (m *Manager) Promote(agentID string, req PromoteRequest) (domain.PromoteResult, error) {
-	state, err := m.registry.MustGet(agentID)
+	state, err := m.ensureState(agentID)
 	if err != nil {
 		return domain.PromoteResult{}, err
 	}
@@ -324,7 +496,7 @@ func (m *Manager) Promote(agentID string, req PromoteRequest) (domain.PromoteRes
 	}
 	args = append(args, state.BranchName, "-m", fmt.Sprintf("promote %s into %s", state.BranchName, targetBranch))
 
-	if _, err := m.git(m.repoRoot, nil, args...); err != nil {
+	if _, err := m.git(m.repoRoot, gitIdentityEnv("", ""), args...); err != nil {
 		// promote 发生冲突时直接回滚 repo root，避免 main 留在半合并状态。
 		statusOut, statusErr := m.git(m.repoRoot, nil, "status", "--porcelain=v1", "--untracked-files=no")
 		if statusErr == nil {
@@ -384,12 +556,162 @@ func (m *Manager) worktreePath(agentID string) string {
 	return filepath.Join(m.worktreeRoot, agentID)
 }
 
+func (m *Manager) ensureState(agentID string) (*worktree.State, error) {
+	state, err := m.registry.MustGet(agentID)
+	if err == nil {
+		return state, nil
+	}
+	if !errors.Is(err, domain.ErrWorktreeNotPrepared) {
+		return nil, err
+	}
+	if _, err := m.Ensure(agentID); err != nil {
+		return nil, err
+	}
+	return m.registry.MustGet(agentID)
+}
+
 func (m *Manager) revParse(cwd string, ref string) (string, error) {
 	stdout, err := m.git(cwd, nil, "rev-parse", ref)
 	if err != nil {
 		return "", err
 	}
 	return strings.TrimSpace(stdout), nil
+}
+
+func (m *Manager) ensureRepoReady() error {
+	if err := os.MkdirAll(m.repoRoot, 0o755); err != nil {
+		return err
+	}
+
+	if ok, err := m.isGitRepo(); err != nil {
+		return err
+	} else if !ok {
+		if _, err := m.git(m.repoRoot, nil, "init", "--initial-branch=main"); err != nil {
+			return err
+		}
+	}
+
+	if _, err := m.revParse(m.repoRoot, "HEAD"); err == nil {
+		return nil
+	}
+
+	if _, err := m.git(m.repoRoot, nil, "add", "-A", "--", "."); err != nil {
+		return err
+	}
+	env := map[string]string{
+		"GIT_AUTHOR_NAME":     "AgentHub Sandbox",
+		"GIT_AUTHOR_EMAIL":    "sandbox@agenthub.local",
+		"GIT_COMMITTER_NAME":  "AgentHub Sandbox",
+		"GIT_COMMITTER_EMAIL": "sandbox@agenthub.local",
+	}
+	_, err := m.git(m.repoRoot, env, "commit", "--allow-empty", "-m", "initial workspace snapshot")
+	return err
+}
+
+func (m *Manager) isGitRepo() (bool, error) {
+	if _, err := os.Stat(m.repoRoot); err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	stdout, err := m.git(m.repoRoot, nil, "rev-parse", "--is-inside-work-tree")
+	if err != nil {
+		return false, nil
+	}
+	return strings.TrimSpace(stdout) == "true", nil
+}
+
+func (m *Manager) stateFromGitWorktree(entry gitWorktreeEntry) (*worktree.State, bool) {
+	rootPath := filepath.Clean(entry.Path)
+	if rootPath == "" || rootPath == "." {
+		return nil, false
+	}
+	rootPathReal := realPathOrClean(rootPath)
+	if rootPathReal == realPathOrClean(m.repoRoot) {
+		return nil, false
+	}
+	worktreeRootReal := realPathOrClean(m.worktreeRoot)
+	if err := security.EnsureWithin(worktreeRootReal, rootPathReal); err != nil {
+		return nil, false
+	}
+	rel, err := filepath.Rel(worktreeRootReal, rootPathReal)
+	if err != nil || rel == "." || rel == "" || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return nil, false
+	}
+	if strings.Contains(rel, string(filepath.Separator)) {
+		return nil, false
+	}
+
+	agentID := filepath.ToSlash(rel)
+	if err := validateAgentID(agentID); err != nil {
+		return nil, false
+	}
+	rootPath = filepath.Clean(m.worktreePath(agentID))
+	info, err := os.Stat(rootPath)
+	if err != nil || !info.IsDir() {
+		return nil, false
+	}
+
+	headSHA := entry.HeadSHA
+	if headSHA == "" {
+		headSHA, err = m.revParse(rootPath, "HEAD")
+		if err != nil {
+			return nil, false
+		}
+	}
+	branchName := entry.BranchName
+	if branchName == "" {
+		branchName = defaultBranchName(agentID)
+	}
+
+	return &worktree.State{
+		AgentID:       agentID,
+		BranchName:    branchName,
+		RootPath:      rootPath,
+		HeadSHA:       headSHA,
+		PreparedAt:    info.ModTime().UTC(),
+		ActiveExecIDs: make(map[string]struct{}),
+	}, true
+}
+
+func realPathOrClean(path string) string {
+	realPath, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return filepath.Clean(path)
+	}
+	return filepath.Clean(realPath)
+}
+
+func parseGitWorktreeList(stdout string) []gitWorktreeEntry {
+	var entries []gitWorktreeEntry
+	var current gitWorktreeEntry
+	flush := func() {
+		if current.Path != "" {
+			entries = append(entries, current)
+			current = gitWorktreeEntry{}
+		}
+	}
+
+	for _, line := range strings.Split(stdout, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			flush()
+			continue
+		}
+		switch {
+		case strings.HasPrefix(line, "worktree "):
+			flush()
+			current.Path = strings.TrimSpace(strings.TrimPrefix(line, "worktree "))
+		case strings.HasPrefix(line, "HEAD "):
+			current.HeadSHA = strings.TrimSpace(strings.TrimPrefix(line, "HEAD "))
+		case strings.HasPrefix(line, "branch "):
+			branch := strings.TrimSpace(strings.TrimPrefix(line, "branch "))
+			current.BranchName = strings.TrimPrefix(branch, "refs/heads/")
+		}
+	}
+	flush()
+	return entries
 }
 
 // git 是所有 git 子命令的统一入口，方便控制 cwd、env 和错误格式。
@@ -431,6 +753,17 @@ func defaultString(value, fallback string) string {
 		return fallback
 	}
 	return value
+}
+
+func gitIdentityEnv(authorName, authorEmail string) map[string]string {
+	name := defaultString(authorName, "AgentHub Sandbox")
+	email := defaultString(authorEmail, "sandbox@agenthub.local")
+	return map[string]string{
+		"GIT_AUTHOR_NAME":     name,
+		"GIT_AUTHOR_EMAIL":    email,
+		"GIT_COMMITTER_NAME":  name,
+		"GIT_COMMITTER_EMAIL": email,
+	}
 }
 
 // parseStatus 会把 git porcelain 输出转成前端更容易消费的结构。
@@ -541,6 +874,15 @@ func normalizeStatusPath(path string) string {
 		path = parts[len(parts)-1]
 	}
 	return filepath.ToSlash(filepath.Clean(path))
+}
+
+func dirtyPaths(status domain.StatusSummary) []string {
+	items := make([]string, 0, len(status.Staged)+len(status.Unstaged)+len(status.Untracked)+len(status.Conflicted))
+	items = append(items, status.Staged...)
+	items = append(items, status.Unstaged...)
+	items = append(items, status.Untracked...)
+	items = append(items, status.Conflicted...)
+	return uniqueSorted(items)
 }
 
 func splitLines(stdout string) []string {

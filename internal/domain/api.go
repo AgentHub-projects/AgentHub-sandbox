@@ -40,6 +40,17 @@ type StatusSummary struct {
 	Conflicted []string `json:"conflicted"`
 }
 
+type AgentCompletionResult struct {
+	Status     string   `json:"status"`
+	BranchName string   `json:"branchName"`
+	HeadSHA    string   `json:"headSha,omitempty"`
+	CommitSHA  string   `json:"commitSha,omitempty"`
+	Staged     []string `json:"staged,omitempty"`
+	Unstaged   []string `json:"unstaged,omitempty"`
+	Untracked  []string `json:"untracked,omitempty"`
+	Conflicted []string `json:"conflicted,omitempty"`
+}
+
 type DiffFile struct {
 	Path      string `json:"path"`
 	Status    string `json:"status"`
@@ -59,6 +70,16 @@ type MergeResult struct {
 	SourceBranch   string   `json:"sourceBranch,omitempty"`
 	TargetBranch   string   `json:"targetBranch"`
 	MergeCommitSHA string   `json:"mergeCommitSha,omitempty"`
+	Conflicted     []string `json:"conflicted,omitempty"`
+}
+
+type SyncResult struct {
+	Status         string   `json:"status"`
+	SourceRef      string   `json:"sourceRef"`
+	TargetBranch   string   `json:"targetBranch"`
+	HeadSHA        string   `json:"headSha,omitempty"`
+	MergeCommitSHA string   `json:"mergeCommitSha,omitempty"`
+	Dirty          []string `json:"dirty,omitempty"`
 	Conflicted     []string `json:"conflicted,omitempty"`
 }
 

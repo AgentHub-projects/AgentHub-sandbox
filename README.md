@@ -63,7 +63,7 @@ ok
 
 ### `GET /git/agents`
 
-返回所有已 prepare 的 agent：
+返回所有已由工具调用懒加载初始化过的 agent：
 
 ```json
 {
@@ -79,35 +79,34 @@ ok
 }
 ```
 
-### `POST /git/agents/{agentId}/prepare`
-
-请求：
-
-```json
-{
-  "fromRef": "main",
-  "branchName": "agent/worker-1",
-  "reset": true
-}
-```
-
 ### `GET /git/agents/{agentId}/status`
 
-返回 branch、head、staged、unstaged、untracked、conflicted。
+返回 branch、head、staged、unstaged、untracked、conflicted；如果 agent worktree 还不存在，会在处理请求时自动初始化。
 
 ### `GET /git/agents/{agentId}/diff?base=main`
 
 返回文件级 diff 摘要和 patch。
 
-### `POST /git/agents/{agentId}/commit`
+### `POST /git/agents/{agentId}/complete`
 
-请求：
+agent/worker 完成时由 runtime 自动调用，用于检查该 agent worktree 并在存在改动时自动提交。没有改动返回 `status: "clean"`，有改动返回 `status: "committed"` 和 `commitSha`，存在冲突时返回 409。顶层 leader 会话完成后，runtime 会在 complete `agent/leader` 成功后调用 promote，把 `agent/leader` 合入 `main`。
 
 ```json
 {
-  "message": "worker change",
+  "message": "agent(worker-1): complete session work",
   "authorName": "AgentHub Worker",
   "authorEmail": "worker@agenthub.local"
+}
+```
+
+### `POST /git/agents/{agentId}/sync`
+
+把主仓库目标 ref 合入该 agent 自己的 worktree。默认 `fromRef` 为 `main`；如果 worktree 有未提交内容，会返回 `status: "dirty"` 并拒绝合并。
+
+```json
+{
+  "fromRef": "main",
+  "noFF": false
 }
 ```
 
@@ -214,7 +213,7 @@ ok
 - `internal/worktree`：维护 `agentId -> WorktreeState`
 - `internal/filesystem`：安全读写、版本戳、watch 广播
 - `internal/executor`：命令执行、stdout/stderr 流式回传、kill/timeout
-- `internal/gitmgr`：git worktree / status / diff / commit / merge / promote
+- `internal/gitmgr`：git worktree / status / diff / complete / merge / promote
 - `internal/transport/httpapi`：HTTP 路由
 - `internal/transport/socketio`：Socket.IO 事件
 - `internal/security`：路径归一化和 worktree 越界保护

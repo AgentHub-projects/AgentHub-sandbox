@@ -65,7 +65,8 @@ type job struct {
 
 // Manager 管理每个 agent worktree 里的命令执行任务。
 type Manager struct {
-	registry *worktree.Registry
+	registry    *worktree.Registry
+	ensureAgent func(agentID string) error
 
 	mu   sync.RWMutex
 	jobs map[string]*job
@@ -76,6 +77,10 @@ func NewManager(registry *worktree.Registry) *Manager {
 		registry: registry,
 		jobs:     make(map[string]*job),
 	}
+}
+
+func (m *Manager) SetEnsureAgent(ensure func(agentID string) error) {
+	m.ensureAgent = ensure
 }
 
 func (m *Manager) Close() error {
@@ -95,7 +100,7 @@ func (m *Manager) Close() error {
 
 // Start 会在 agent 对应的 worktree 内启动一个新进程，并挂上输出回调。
 func (m *Manager) Start(agentID string, req StartRequest, callbacks Callbacks) (StartResult, error) {
-	state, err := m.registry.MustGet(agentID)
+	state, err := m.state(agentID)
 	if err != nil {
 		return StartResult{}, err
 	}
@@ -215,6 +220,20 @@ func (m *Manager) Start(agentID string, req StartRequest, callbacks Callbacks) (
 		StartedAt: startedAt,
 		Cwd:       cwd,
 	}, nil
+}
+
+func (m *Manager) state(agentID string) (*worktree.State, error) {
+	state, err := m.registry.MustGet(agentID)
+	if err == nil {
+		return state, nil
+	}
+	if !errors.Is(err, domain.ErrWorktreeNotPrepared) || m.ensureAgent == nil {
+		return nil, err
+	}
+	if err := m.ensureAgent(agentID); err != nil {
+		return nil, err
+	}
+	return m.registry.MustGet(agentID)
 }
 
 // RunBlocking 给兼容 HTTP 端点复用，内部还是走同一套 Start 流程。

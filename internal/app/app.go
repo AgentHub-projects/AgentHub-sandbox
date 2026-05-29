@@ -29,6 +29,26 @@ func New(cfg config.Config) (http.Handler, func(), error) {
 	}
 	execManager := executor.NewManager(registry)
 	gitManager := gitmgr.NewManager(cfg.RepoRoot, cfg.WorktreeRoot, registry, fsService.NotifyChange)
+	ensureAgent := func(agentID string) error {
+		if _, err := gitManager.Ensure(agentID); err != nil {
+			return err
+		}
+		return fsService.SyncAgent(agentID)
+	}
+	fsService.SetEnsureAgent(ensureAgent)
+	execManager.SetEnsureAgent(ensureAgent)
+
+	restoredAgents, err := gitManager.RestoreWorktrees()
+	if err != nil {
+		_ = fsService.Close()
+		return nil, func() {}, err
+	}
+	for _, info := range restoredAgents {
+		if err := fsService.SyncAgent(info.AgentID); err != nil {
+			_ = fsService.Close()
+			return nil, func() {}, err
+		}
+	}
 	socketServer := socketio.New(fsService, execManager)
 	httpRouter := httpapi.New(fsService, execManager, gitManager)
 

@@ -2,6 +2,8 @@ package filesystem
 
 import (
 	"errors"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -68,5 +70,51 @@ gotWriteEvent:
 
 	if _, err := service.Write("leader", "src/main.go", "package sandbox\n", "wrong-version", false, "ui"); !errors.Is(err, domain.ErrVersionConflict) {
 		t.Fatalf("expected version conflict, got %v", err)
+	}
+}
+
+func TestServiceLazilyEnsuresAgent(t *testing.T) {
+	root := t.TempDir()
+	registry := worktree.NewRegistry()
+	hub := watcher.NewHub()
+
+	service, err := NewService(registry, hub)
+	if err != nil {
+		t.Fatalf("create service: %v", err)
+	}
+	defer service.Close()
+
+	ensured := 0
+	service.SetEnsureAgent(func(agentID string) error {
+		ensured++
+		registry.Upsert(&worktree.State{
+			AgentID:       agentID,
+			BranchName:    "agent/" + agentID,
+			RootPath:      root,
+			HeadSHA:       "head",
+			ActiveExecIDs: map[string]struct{}{},
+		})
+		return service.SyncAgent(agentID)
+	})
+
+	if _, err := service.Write("leader", "lazy.txt", "hello\n", "", true, "ui"); err != nil {
+		t.Fatalf("write should lazily ensure agent: %v", err)
+	}
+	if ensured != 1 {
+		t.Fatalf("expected one lazy ensure, got %d", ensured)
+	}
+	data, err := os.ReadFile(filepath.Join(root, "lazy.txt"))
+	if err != nil {
+		t.Fatalf("read lazy file: %v", err)
+	}
+	if string(data) != "hello\n" {
+		t.Fatalf("unexpected lazy file content: %q", string(data))
+	}
+
+	if _, err := service.Read("leader", "lazy.txt", 0, 0); err != nil {
+		t.Fatalf("read should use existing agent: %v", err)
+	}
+	if ensured != 1 {
+		t.Fatalf("expected no second ensure, got %d", ensured)
 	}
 }
