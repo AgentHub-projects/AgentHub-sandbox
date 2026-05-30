@@ -6,6 +6,8 @@
 - 基于 Socket.IO 的命令执行与文件访问
 - 基于 HTTP 的 git worktree / branch / merge / promote 编排
 
+如果是第一次读这个项目，建议先看 [项目流程与代码结构概览](docs/project-overview.md)。
+
 ## 设计约束
 
 - sandbox 不再接收 `sessionId`
