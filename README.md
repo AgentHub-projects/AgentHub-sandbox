@@ -22,8 +22,8 @@
 
 - `HOST`，默认 `0.0.0.0`
 - `PORT`，默认 `8080`
-- `REPO_ROOT`，默认 `/workspace/repo`
-- `WORKTREE_ROOT`，默认 `/workspace-worktrees`
+- `REPO_ROOT`，默认 `/sandbox/views/workspace/repo`
+- `WORKTREE_ROOT`，默认 `/sandbox/views/workspace/worktrees`
 
 ## HTTP 接口
 

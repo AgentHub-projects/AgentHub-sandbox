@@ -14,6 +14,8 @@ RUN apt-get update \
 	&& apt-get install -y --no-install-recommends git ca-certificates bash tini \
 	&& rm -rf /var/lib/apt/lists/*
 
+RUN git config --system --add safe.directory '*'
+
 RUN useradd --create-home --uid 10001 --shell /bin/bash sandbox \
 	&& mkdir -p /workspace/repo /workspace-worktrees \
 	&& chown -R sandbox:sandbox /workspace /workspace-worktrees
@@ -24,8 +26,8 @@ COPY --from=build /out/agenthub-sandbox /usr/local/bin/agenthub-sandbox
 
 ENV HOST=0.0.0.0
 ENV PORT=8080
-ENV REPO_ROOT=/workspace/repo
-ENV WORKTREE_ROOT=/workspace-worktrees
+ENV REPO_ROOT=/sandbox/views/workspace/repo
+ENV WORKTREE_ROOT=/sandbox/views/workspace/worktrees
 
 USER sandbox
 

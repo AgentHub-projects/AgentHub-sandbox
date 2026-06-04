@@ -18,8 +18,8 @@ func Load() (Config, error) {
 	cfg := Config{
 		Host:         stringOrDefault(os.Getenv("HOST"), "0.0.0.0"),
 		Port:         intOrDefault(os.Getenv("PORT"), 8080),
-		RepoRoot:     stringOrDefault(os.Getenv("REPO_ROOT"), "/workspace/repo"),
-		WorktreeRoot: stringOrDefault(os.Getenv("WORKTREE_ROOT"), "/workspace-worktrees"),
+		RepoRoot:     stringOrDefault(os.Getenv("REPO_ROOT"), "/sandbox/views/workspace/repo"),
+		WorktreeRoot: stringOrDefault(os.Getenv("WORKTREE_ROOT"), "/sandbox/views/workspace/worktrees"),
 	}
 
 	repoRoot, err := filepath.Abs(cfg.RepoRoot)
