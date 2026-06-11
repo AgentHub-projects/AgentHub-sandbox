@@ -11,16 +11,15 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /out/agenthub-sandbox ./cm
 FROM debian:bookworm-slim
 
 RUN apt-get update \
-	&& apt-get install -y --no-install-recommends git ca-certificates bash tini \
-	&& rm -rf /var/lib/apt/lists/*
+	&& apt-get install -y --no-install-recommends git ca-certificates bash tini nodejs npm \
+	&& npm install -g vercel \
+	&& rm -rf /var/lib/apt/lists/* ~/.npm
 
 RUN git config --system --add safe.directory '*'
 
-RUN useradd --create-home --uid 10001 --shell /bin/bash sandbox \
-	&& mkdir -p /workspace/repo /workspace-worktrees \
-	&& chown -R sandbox:sandbox /workspace /workspace-worktrees
+RUN useradd --create-home --uid 10001 --shell /bin/bash sandbox
 
-WORKDIR /workspace
+WORKDIR /home/sandbox
 
 COPY --from=build /out/agenthub-sandbox /usr/local/bin/agenthub-sandbox
 

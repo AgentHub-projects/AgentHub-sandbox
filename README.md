@@ -7,6 +7,7 @@
 - 基于 HTTP 的 git worktree / branch / merge / promote 编排
 
 如果是第一次读这个项目，建议先看 [项目流程与代码结构概览](docs/project-overview.md)。
+用户侧 main commit 历史和 diff 接口设计见 [Main Git HTTP API](docs/main-git-api.md)。
 
 ## 设计约束
 
@@ -14,6 +15,7 @@
 - sandbox 不再要求外部传 `worktreeId`
 - 内部只维护 `agentId -> WorktreeState` 的内存映射
 - `/filesystem/socket.io` 与 `/agents/socket.io` 强制走 websocket transport
+- `/filesystem/socket.io` 不接收 `agentId`，默认读写 `main` 分支并自动提交用户改动
 - `/git` 只提供编排能力，是否并入 `main` 由 leader 决定
 
 ## 配置
@@ -59,11 +61,15 @@ ok
 
 ### `GET /download/*path`
 
-请求头优先读取 `X-AgentHub-Agent-Id`，兼容 query `agentId`。
+下载 `main` 文件视图中的文件原文，不需要 `agentId`。若该路径命中 `.agenthub/image-manifest.json` 中的图片预览映射，则返回 302 跳转到长期 OSS 预览 URL。
 
-返回文件原文。
+### `GET /read/*path`
+
+agent runtime 内部结构化读取接口。直连 sandbox 时通过 `X-AgentHub-Agent-Id` 请求头读取当前 agent worktree；没有该请求头时读取 `main`。用户侧文件读取不走这个 HTTP 接口，走 `/filesystem/socket.io` 的 `fs:read`。
 
 ### `GET /git/agents`
+
+agent runtime 直接调用 `/git/agents...`；用户侧 main commit 历史和 diff 只走 `/filesystem/git/main/commits...`。
 
 返回所有已由工具调用懒加载初始化过的 agent：
 
@@ -89,15 +95,45 @@ ok
 
 返回文件级 diff 摘要和 patch。
 
+### `POST /git/agents/{agentId}/images/manifest`
+
+agent runtime 写入图片预览映射。manifest 存在 worktree 的 `.agenthub/image-manifest.json`，由 workspace 持久化保存，但不会出现在文件列表、读写接口或 git diff/commit 中。写入时会同时更新当前 agent worktree 和 `main` 视图的 manifest；用户侧文件预览只读取 `main`。
+
+```json
+{
+  "path": "assets/generated/test.png",
+  "previewUrl": "https://cdn.example.com/test.png",
+  "ossUri": "oss://bucket/key",
+  "ossObjectKey": "key",
+  "mimeType": "image/png",
+  "sizeBytes": 123456,
+  "width": 1024,
+  "height": 1024,
+  "sha256": "..."
+}
+```
+
 ### `POST /git/agents/{agentId}/complete`
 
-agent/worker 完成时由 runtime 自动调用，用于检查该 agent worktree 并在存在改动时自动提交。没有改动返回 `status: "clean"`，有改动返回 `status: "committed"` 和 `commitSha`，存在冲突时返回 409。顶层 leader 会话完成后，runtime 会在 complete `agent/leader` 成功后调用 promote，把 `agent/leader` 合入 `main`。
+agent/worker 完成时由 runtime 自动调用，用于检查该 agent worktree 并在存在改动时自动提交。没有改动返回 `status: "clean"`，有改动返回 `status: "committed"`、`commitSha` 和本次 commit 的 `patch`，存在冲突时返回 409。顶层 leader 会话完成后，runtime 会在 complete `agent/leader` 成功后调用 promote，把 `agent/leader` 合入 `main`。
 
 ```json
 {
   "message": "agent(worker-1): complete session work",
   "authorName": "AgentHub Worker",
   "authorEmail": "worker@agenthub.local"
+}
+```
+
+提交成功时返回：
+
+```json
+{
+  "status": "committed",
+  "branchName": "agent/worker-1",
+  "headSha": "abc123",
+  "commitSha": "abc123",
+  "patch": "diff --git a/result.txt b/result.txt\n..."
 }
 ```
 
@@ -157,7 +193,11 @@ agent/worker 完成时由 runtime 自动调用，用于检查该 agent worktree 
 - `/filesystem/socket.io`
 - `/agents/socket.io`
 
-连接参数：
+`/filesystem/socket.io` 连接参数：
+
+- 不需要 `agentId`
+
+`/agents/socket.io` 连接参数：
 
 - `auth.agentId`，推荐
 - `query.agentId`，兼容
@@ -187,13 +227,12 @@ agent/worker 完成时由 runtime 自动调用，用于检查该 agent worktree 
 
 ### `/filesystem/socket.io`
 
-- `fs:info`
 - `fs:list`
-- `fs:read`
-- `fs:write`
-- `fs:watch`
-- `fs:unwatch`
-- 服务端推送 `fs:changed`
+- `fs:read`：读取 main 文件视图，图片命中 manifest 时返回 `preview`
+- `fs:update`
+- 连接后服务端主动推送 `fs:changed`
+- `main` 产生新提交后服务端主动推送 `main:committed`
+- `fs:update` 成功后自动提交到 `main`
 
 ### `/agents/socket.io`
 

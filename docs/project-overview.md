@@ -40,6 +40,8 @@ WORKTREE_ROOT = /workspace-worktrees
 
 每个 agent 都不是直接改 `main`，而是在自己的 Git worktree 里改。
 
+用户侧文件浏览/编辑接口不属于 agent worktree：它默认读写 `/workspace/repo` 的 `main` 视图，并在用户修改成功后自动提交。
+
 ## 启动流程
 
 入口是：
@@ -215,13 +217,11 @@ internal/transport/socketio/server.go
 `/filesystem/socket.io` 更像前端文件浏览器：
 
 ```text
-fs:info
 fs:list
 fs:read
-fs:write
-fs:watch
-fs:unwatch
-fs:changed
+fs:update
+fs:changed  # 连接后自动推送
+main:committed  # main 产生新提交后自动推送
 ```
 
 `/agents/socket.io` 更像 agent runtime 通道：
@@ -242,11 +242,11 @@ exec:error
 简单说：
 
 ```text
-filesystem socket 偏 UI 文件操作
+filesystem socket 偏 UI 文件操作，默认 main，不需要 agentId
 agents socket 偏 agent 执行与读写
 ```
 
-但底层都复用同一个 `filesystem.Service` 和 `executor.Manager`。
+两条链路复用底层 `filesystem.Service`；用户写入还会调用 `gitmgr.Manager` 自动提交到 main。
 
 ## 文件读写流程
 
@@ -259,13 +259,15 @@ internal/filesystem/service.go
 以写文件为例：
 
 ```text
-收到 fs:write 或 file:write
-拿 agentId 找 worktree
-如果 agent 不存在，就自动 Ensure
+收到 fs:update 或 file:write
+fs:update 使用 main 视图，不需要 agentId
+file:write 根据 agentId 找 agent worktree，如果 agent 不存在就自动 Ensure
 校验路径不能逃出 worktree
 如果传了 expectedVersion，就检查版本是否冲突
-写入文件
+fs:update 应用用户提交的文本变更，file:write 写入 agent 工具传入的内容
+fs:update 成功后自动提交到 main
 广播 fs:changed
+如果 main 产生新 commit，再广播 main:committed
 ```
 
 路径安全很重要。比如 agent 想写：
@@ -282,7 +284,7 @@ internal/filesystem/service.go
 fsnotify + watcher.Hub
 ```
 
-也就是说，如果 agent 写了文件，前端订阅了这个 agent 的变化，就能收到 `fs:changed`。
+也就是说，前端连接 filesystem socket 后，会收到 main 文件视图的 `fs:changed`；main 历史更新时还会收到 `main:committed`，再按需查询 main commit 列表和 diff。agent 自己 worktree 的变化不会直接暴露成用户文件视图。
 
 ## 命令执行流程
 

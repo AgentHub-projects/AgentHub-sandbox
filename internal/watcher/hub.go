@@ -72,23 +72,6 @@ func (h *Hub) SetPaths(subscriberID string, paths []string) []string {
 	return normalized
 }
 
-func (h *Hub) RemovePaths(subscriberID string, paths []string) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-
-	sub := h.subs[subscriberID]
-	if sub == nil {
-		return
-	}
-	if len(paths) == 0 {
-		sub.paths = make(map[string]struct{})
-		return
-	}
-	for _, item := range paths {
-		delete(sub.paths, normalizePath(item))
-	}
-}
-
 func (h *Hub) Broadcast(event Event) {
 	h.mu.RLock()
 	defer h.mu.RUnlock()

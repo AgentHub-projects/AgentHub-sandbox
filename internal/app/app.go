@@ -5,6 +5,7 @@ import (
 	"os"
 
 	"agenthub-sandbox/internal/config"
+	"agenthub-sandbox/internal/domain"
 	"agenthub-sandbox/internal/executor"
 	"agenthub-sandbox/internal/filesystem"
 	"agenthub-sandbox/internal/gitmgr"
@@ -30,6 +31,12 @@ func New(cfg config.Config) (http.Handler, func(), error) {
 	execManager := executor.NewManager(registry)
 	gitManager := gitmgr.NewManager(cfg.RepoRoot, cfg.WorktreeRoot, registry, fsService.NotifyChange)
 	ensureAgent := func(agentID string) error {
+		if agentID == domain.MainWorkspaceID {
+			if _, err := gitManager.EnsureMainWorkspace(); err != nil {
+				return err
+			}
+			return fsService.SyncAgent(agentID)
+		}
 		if _, err := gitManager.Ensure(agentID); err != nil {
 			return err
 		}
@@ -37,6 +44,11 @@ func New(cfg config.Config) (http.Handler, func(), error) {
 	}
 	fsService.SetEnsureAgent(ensureAgent)
 	execManager.SetEnsureAgent(ensureAgent)
+
+	if err := ensureAgent(domain.MainWorkspaceID); err != nil {
+		_ = fsService.Close()
+		return nil, func() {}, err
+	}
 
 	restoredAgents, err := gitManager.RestoreWorktrees()
 	if err != nil {
@@ -49,7 +61,8 @@ func New(cfg config.Config) (http.Handler, func(), error) {
 			return nil, func() {}, err
 		}
 	}
-	socketServer := socketio.New(fsService, execManager)
+	socketServer := socketio.New(fsService, execManager, gitManager)
+	gitManager.SetMainCommitNotifier(socketServer.EmitMainCommitted)
 	httpRouter := httpapi.New(fsService, execManager, gitManager)
 
 	mux := http.NewServeMux()

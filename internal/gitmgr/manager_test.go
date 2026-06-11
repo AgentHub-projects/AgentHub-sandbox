@@ -1,12 +1,14 @@
 package gitmgr
 
 import (
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"agenthub-sandbox/internal/domain"
 	"agenthub-sandbox/internal/worktree"
 )
 
@@ -91,6 +93,12 @@ func TestManagerCompleteCommitsDirtyWorktree(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(worker.RootPath, "result.txt"), []byte("done\n"), 0o644); err != nil {
 		t.Fatalf("write worker file: %v", err)
 	}
+	if err := os.MkdirAll(filepath.Join(worker.RootPath, ".agenthub"), 0o755); err != nil {
+		t.Fatalf("create internal metadata dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(worker.RootPath, ".agenthub", "image-manifest.json"), []byte(`{"version":1}`), 0o644); err != nil {
+		t.Fatalf("write internal metadata: %v", err)
+	}
 
 	result, err := manager.Complete("worker-1", CompleteRequest{Message: "agent(worker-1): complete session work"})
 	if err != nil {
@@ -98,6 +106,12 @@ func TestManagerCompleteCommitsDirtyWorktree(t *testing.T) {
 	}
 	if result.Status != "committed" || result.CommitSHA == "" {
 		t.Fatalf("expected committed completion result, got %+v", result)
+	}
+	if !strings.Contains(result.Patch, "+done") {
+		t.Fatalf("expected completion patch to include written file, got %q", result.Patch)
+	}
+	if strings.Contains(result.Patch, ".agenthub") {
+		t.Fatalf("completion patch should not include internal metadata, got %q", result.Patch)
 	}
 	status, err := manager.Status("worker-1")
 	if err != nil {
@@ -113,6 +127,141 @@ func TestManagerCompleteCommitsDirtyWorktree(t *testing.T) {
 	}
 	if clean.Status != "clean" {
 		t.Fatalf("expected clean completion result, got %+v", clean)
+	}
+}
+
+func TestManagerMainWorkspaceUsesRepoRootAndCommits(t *testing.T) {
+	repoRoot := t.TempDir()
+	worktreeRoot := t.TempDir()
+	if err := os.WriteFile(filepath.Join(repoRoot, "README.md"), []byte("hello\n"), 0o644); err != nil {
+		t.Fatalf("write initial file: %v", err)
+	}
+
+	registry := worktree.NewRegistry()
+	manager := NewManager(repoRoot, worktreeRoot, registry, func(string, string, string, string) {})
+
+	info, err := manager.EnsureMainWorkspace()
+	if err != nil {
+		t.Fatalf("ensure main workspace: %v", err)
+	}
+	if info.AgentID != domain.MainWorkspaceID || info.BranchName != "main" || info.RootPath != repoRoot {
+		t.Fatalf("unexpected main workspace info: %+v", info)
+	}
+	if _, err := os.Stat(filepath.Join(worktreeRoot, domain.MainWorkspaceID)); !os.IsNotExist(err) {
+		t.Fatalf("main workspace should not create an agent worktree, stat err: %v", err)
+	}
+	if agents := manager.ListAgents(); len(agents) != 0 {
+		t.Fatalf("main workspace should be hidden from agent list, got %+v", agents)
+	}
+
+	if err := os.WriteFile(filepath.Join(repoRoot, "ui.txt"), []byte("user edit\n"), 0o644); err != nil {
+		t.Fatalf("write ui file: %v", err)
+	}
+	branchName, commitSHA, err := manager.Commit(domain.MainWorkspaceID, CommitRequest{
+		Message: "workspace: update ui.txt",
+	})
+	if err != nil {
+		t.Fatalf("commit main workspace: %v", err)
+	}
+	if branchName != "main" || commitSHA == "" {
+		t.Fatalf("unexpected commit result: branch=%q sha=%q", branchName, commitSHA)
+	}
+	if status := gitOutput(t, repoRoot, "status", "--short"); strings.TrimSpace(status) != "" {
+		t.Fatalf("expected clean repo after main commit, got %q", status)
+	}
+}
+
+func TestManagerMainCommitHistoryAndDiff(t *testing.T) {
+	repoRoot := t.TempDir()
+	worktreeRoot := t.TempDir()
+
+	runGit(t, repoRoot, "init", "--initial-branch=main")
+	if err := os.WriteFile(filepath.Join(repoRoot, "README.md"), []byte("hello\n"), 0o644); err != nil {
+		t.Fatalf("write initial file: %v", err)
+	}
+	runGit(t, repoRoot, "add", "README.md")
+	runGitWithEnv(t, repoRoot, gitIdentityEnv("Test", "test@example.com"), "commit", "-m", "initial commit")
+
+	registry := worktree.NewRegistry()
+	manager := NewManager(repoRoot, worktreeRoot, registry, func(string, string, string, string) {})
+	if _, err := manager.EnsureMainWorkspace(); err != nil {
+		t.Fatalf("ensure main workspace: %v", err)
+	}
+
+	var event domain.MainCommitEvent
+	manager.SetMainCommitNotifier(func(got domain.MainCommitEvent) {
+		event = got
+	})
+
+	if err := os.WriteFile(filepath.Join(repoRoot, "README.md"), []byte("hello\nworld\n"), 0o644); err != nil {
+		t.Fatalf("modify README: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repoRoot, "note.txt"), []byte("new note\n"), 0o644); err != nil {
+		t.Fatalf("write note: %v", err)
+	}
+	_, commitSHA, err := manager.Commit(domain.MainWorkspaceID, CommitRequest{Message: "workspace: update docs"})
+	if err != nil {
+		t.Fatalf("commit main workspace: %v", err)
+	}
+	if event.CommitSHA != commitSHA || event.BranchName != "main" || event.Comment != "workspace: update docs" {
+		t.Fatalf("unexpected main commit event: %+v", event)
+	}
+	if event.ParentCommitSHA == "" || event.CommittedAt.IsZero() {
+		t.Fatalf("expected event parent and time, got %+v", event)
+	}
+
+	list, err := manager.ListMainCommits(1, "")
+	if err != nil {
+		t.Fatalf("list main commits: %v", err)
+	}
+	if len(list.Items) != 1 || list.Items[0].CommitSHA != commitSHA || !list.HasMore || list.NextCursor != commitSHA {
+		t.Fatalf("unexpected first page: %+v", list)
+	}
+	next, err := manager.ListMainCommits(10, list.NextCursor)
+	if err != nil {
+		t.Fatalf("list next main commits: %v", err)
+	}
+	if len(next.Items) != 1 || next.Items[0].Comment != "initial commit" || next.HasMore {
+		t.Fatalf("unexpected second page: %+v", next)
+	}
+
+	diffFiles, err := manager.MainCommitDiffFiles(commitSHA)
+	if err != nil {
+		t.Fatalf("diff files: %v", err)
+	}
+	readme := findMainDiffFile(diffFiles.Files, "README.md")
+	if readme == nil || readme.Status != "modified" || readme.Additions != 1 {
+		t.Fatalf("unexpected README diff entry: %+v in %+v", readme, diffFiles.Files)
+	}
+	note := findMainDiffFile(diffFiles.Files, "note.txt")
+	if note == nil || note.Status != "added" || note.Additions != 1 {
+		t.Fatalf("unexpected note diff entry: %+v in %+v", note, diffFiles.Files)
+	}
+
+	readmeDiff, err := manager.MainCommitDiffFile(commitSHA, "README.md")
+	if err != nil {
+		t.Fatalf("single file diff: %v", err)
+	}
+	if !readmeDiff.BaseFile.Exists || readmeDiff.BaseFile.Content == nil || *readmeDiff.BaseFile.Content != "hello\n" {
+		t.Fatalf("unexpected base file: %+v", readmeDiff.BaseFile)
+	}
+	if !strings.Contains(readmeDiff.Patch, "+world") {
+		t.Fatalf("expected README patch to include added line, got %q", readmeDiff.Patch)
+	}
+
+	noteDiff, err := manager.MainCommitDiffFile(commitSHA, "note.txt")
+	if err != nil {
+		t.Fatalf("added file diff: %v", err)
+	}
+	if noteDiff.BaseFile.Exists || noteDiff.BaseFile.Content != nil {
+		t.Fatalf("expected added file to have no base content, got %+v", noteDiff.BaseFile)
+	}
+
+	if _, err := manager.MainCommitDiffFiles("not-a-commit"); !errors.Is(err, domain.ErrInvalidCommit) {
+		t.Fatalf("expected invalid commit error, got %v", err)
+	}
+	if _, err := manager.MainCommitDiffFile(commitSHA, "missing.txt"); !errors.Is(err, domain.ErrInvalidPath) {
+		t.Fatalf("expected invalid path error, got %v", err)
 	}
 }
 
@@ -301,6 +450,15 @@ func TestManagerRestoreWorktreesFromGitMetadata(t *testing.T) {
 	if len(got.ActiveExecIDs) != 0 {
 		t.Fatalf("expected restored exec ids to be empty, got %+v", got.ActiveExecIDs)
 	}
+}
+
+func findMainDiffFile(files []domain.MainDiffFile, path string) *domain.MainDiffFile {
+	for i := range files {
+		if files[i].Path == path {
+			return &files[i]
+		}
+	}
+	return nil
 }
 
 func runGit(t *testing.T, cwd string, args ...string) {

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"sync"
 
 	"github.com/google/uuid"
 	engineTransports "github.com/zishang520/socket.io/servers/engine/v3/transports"
@@ -13,23 +14,30 @@ import (
 	"agenthub-sandbox/internal/domain"
 	"agenthub-sandbox/internal/executor"
 	"agenthub-sandbox/internal/filesystem"
+	"agenthub-sandbox/internal/gitmgr"
 	"agenthub-sandbox/internal/watcher"
 )
 
 type Server struct {
 	fsService *filesystem.Service
 	exec      *executor.Manager
+	git       *gitmgr.Manager
 	fsIO      *socket.Server
 	agentsIO  *socket.Server
+
+	mainCommitMu      sync.RWMutex
+	mainCommitClients map[*socket.Socket]struct{}
 }
 
 // Server 把 /filesystem 和 /agents 两套 Socket.IO 服务封装在一起。
-func New(fsService *filesystem.Service, execManager *executor.Manager) *Server {
+func New(fsService *filesystem.Service, execManager *executor.Manager, gitManager *gitmgr.Manager) *Server {
 	return &Server{
-		fsService: fsService,
-		exec:      execManager,
-		fsIO:      newSocketServer("/filesystem/socket.io"),
-		agentsIO:  newSocketServer("/agents/socket.io"),
+		fsService:         fsService,
+		exec:              execManager,
+		git:               gitManager,
+		fsIO:              newSocketServer("/filesystem/socket.io"),
+		agentsIO:          newSocketServer("/agents/socket.io"),
+		mainCommitClients: make(map[*socket.Socket]struct{}),
 	}
 }
 
@@ -61,41 +69,27 @@ func (s *Server) bindFilesystem() {
 	nsp := s.fsIO.Of("/", nil)
 	_ = nsp.On("connection", func(args ...any) {
 		client := args[0].(*socket.Socket)
-		agentID, err := socketAgentID(client)
-		if err != nil {
-			_ = client.Emit("connect_error", envelope("", nil, err))
+		workspaceID := domain.MainWorkspaceID
+		if _, err := s.fsService.Info(workspaceID); err != nil {
+			_ = client.Emit("connect_error", workspaceEnvelope("", nil, err))
 			client.Disconnect(true)
 			return
 		}
-		if _, err := s.fsService.Info(agentID); err != nil {
-			_ = client.Emit("connect_error", envelope("", nil, err))
-			client.Disconnect(true)
-			return
-		}
+		s.addMainCommitClient(client)
 
 		subID := uuid.NewString()
-		events, unsubscribe := s.fsServiceWatcher(agentID, subID)
+		events, unsubscribe := s.fsServiceWatcher(workspaceID, subID)
+		s.fsServiceWatcherPaths(subID, []string{"."})
 		go func() {
 			for event := range events {
-				_ = client.Emit("fs:changed", event)
+				_ = client.Emit("fs:changed", filesystemChangePayload(event))
 			}
 		}()
 		_ = client.On("disconnect", func(...any) {
 			unsubscribe()
+			s.removeMainCommitClient(client)
 		})
 
-		registerJSONHandler(client, "fs:info", func(request requestEnvelope) any {
-			info, err := s.fsService.Info(agentID)
-			if err != nil {
-				return envelope(request.RequestID, nil, err)
-			}
-			return envelope(request.RequestID, map[string]any{
-				"agentId":    info.AgentID,
-				"rootPath":   info.RootPath,
-				"branchName": info.BranchName,
-				"headSha":    info.HeadSHA,
-			}, nil)
-		})
 		registerJSONHandler(client, "fs:list", func(request requestEnvelope) any {
 			var body struct {
 				RequestID string `json:"requestId"`
@@ -103,13 +97,13 @@ func (s *Server) bindFilesystem() {
 				Depth     int    `json:"depth"`
 			}
 			if err := decodeBody(request.Raw, &body); err != nil {
-				return envelope(request.RequestID, nil, err)
+				return workspaceEnvelope(request.RequestID, nil, err)
 			}
-			items, err := s.fsService.List(agentID, body.Path, body.Depth)
+			items, err := s.fsService.List(workspaceID, body.Path, body.Depth)
 			if err != nil {
-				return envelope(request.RequestID, nil, err)
+				return workspaceEnvelope(request.RequestID, nil, err)
 			}
-			return envelope(request.RequestID, map[string]any{"entries": items}, nil)
+			return workspaceEnvelope(request.RequestID, map[string]any{"entries": items}, nil)
 		})
 		registerJSONHandler(client, "fs:read", func(request requestEnvelope) any {
 			var body struct {
@@ -119,55 +113,75 @@ func (s *Server) bindFilesystem() {
 				LineEnd   int    `json:"lineEnd"`
 			}
 			if err := decodeBody(request.Raw, &body); err != nil {
-				return envelope(request.RequestID, nil, err)
+				return workspaceEnvelope(request.RequestID, nil, err)
 			}
-			read, err := s.fsService.Read(agentID, body.Path, body.LineStart, body.LineEnd)
+			read, err := s.fsService.Read(workspaceID, body.Path, body.LineStart, body.LineEnd)
 			if err != nil {
-				return envelope(request.RequestID, nil, err)
+				return workspaceEnvelope(request.RequestID, nil, err)
 			}
-			return envelope(request.RequestID, read, nil)
+			return workspaceEnvelope(request.RequestID, read, nil)
 		})
-		registerJSONHandler(client, "fs:write", func(request requestEnvelope) any {
+		registerJSONHandler(client, "fs:update", func(request requestEnvelope) any {
 			var body struct {
-				RequestID       string `json:"requestId"`
-				Path            string `json:"path"`
-				Content         string `json:"content"`
-				ExpectedVersion string `json:"expectedVersion"`
-				CreateDirs      bool   `json:"createDirs"`
+				RequestID       string                `json:"requestId"`
+				Path            string                `json:"path"`
+				ExpectedVersion string                `json:"expectedVersion"`
+				Edits           []filesystem.TextEdit `json:"edits"`
+				CreateDirs      bool                  `json:"createDirs"`
 			}
 			if err := decodeBody(request.Raw, &body); err != nil {
-				return envelope(request.RequestID, nil, err)
+				return workspaceEnvelope(request.RequestID, nil, err)
 			}
-			written, err := s.fsService.Write(agentID, body.Path, body.Content, body.ExpectedVersion, body.CreateDirs, "ui")
+			written, err := s.fsService.ApplyEdits(workspaceID, body.Path, body.ExpectedVersion, body.Edits, body.CreateDirs, "ui")
 			if err != nil {
-				return envelope(request.RequestID, nil, err)
+				return workspaceEnvelope(request.RequestID, nil, err)
 			}
-			return envelope(request.RequestID, written, nil)
-		})
-		registerJSONHandler(client, "fs:watch", func(request requestEnvelope) any {
-			var body struct {
-				RequestID string   `json:"requestId"`
-				Paths     []string `json:"paths"`
+			branchName, commitSHA, err := s.git.Commit(workspaceID, gitmgr.CommitRequest{
+				Message:     "workspace: update " + written.Path,
+				AuthorName:  "AgentHub User",
+				AuthorEmail: "user@agenthub.local",
+			})
+			if err != nil && !errors.Is(err, domain.ErrGitNoChanges) {
+				return workspaceEnvelope(request.RequestID, nil, err)
 			}
-			if err := decodeBody(request.Raw, &body); err != nil {
-				return envelope(request.RequestID, nil, err)
+			if branchName == "" {
+				branchName = "main"
 			}
-			return envelope(request.RequestID, map[string]any{
-				"watching": s.fsServiceWatcherPaths(subID, body.Paths),
+			return workspaceEnvelope(request.RequestID, map[string]any{
+				"path":       written.Path,
+				"size":       written.Size,
+				"mtime":      written.Mtime,
+				"version":    written.Version,
+				"branchName": branchName,
+				"commitSha":  commitSHA,
 			}, nil)
 		})
-		registerJSONHandler(client, "fs:unwatch", func(request requestEnvelope) any {
-			var body struct {
-				RequestID string   `json:"requestId"`
-				Paths     []string `json:"paths"`
-			}
-			if err := decodeBody(request.Raw, &body); err != nil {
-				return envelope(request.RequestID, nil, err)
-			}
-			s.fsServiceUnwatchPaths(subID, body.Paths)
-			return envelope(request.RequestID, map[string]any{"ok": true}, nil)
-		})
 	})
+}
+
+func (s *Server) EmitMainCommitted(event domain.MainCommitEvent) {
+	s.mainCommitMu.RLock()
+	clients := make([]*socket.Socket, 0, len(s.mainCommitClients))
+	for client := range s.mainCommitClients {
+		clients = append(clients, client)
+	}
+	s.mainCommitMu.RUnlock()
+
+	for _, client := range clients {
+		_ = client.Emit("main:committed", event)
+	}
+}
+
+func (s *Server) addMainCommitClient(client *socket.Socket) {
+	s.mainCommitMu.Lock()
+	defer s.mainCommitMu.Unlock()
+	s.mainCommitClients[client] = struct{}{}
+}
+
+func (s *Server) removeMainCommitClient(client *socket.Socket) {
+	s.mainCommitMu.Lock()
+	defer s.mainCommitMu.Unlock()
+	delete(s.mainCommitClients, client)
 }
 
 // bindAgents 处理命令执行流和 agent 侧文件访问。
@@ -367,6 +381,16 @@ func lastAck(args []any) socket.Ack {
 	return ack
 }
 
+func filesystemChangePayload(event watcher.Event) map[string]any {
+	return map[string]any{
+		"path":       event.Path,
+		"changeType": event.ChangeType,
+		"mtime":      event.Mtime,
+		"version":    event.Version,
+		"actor":      event.Actor,
+	}
+}
+
 func socketAgentID(client *socket.Socket) (string, error) {
 	handshake := client.Handshake()
 	if handshake == nil {
@@ -385,12 +409,20 @@ func socketAgentID(client *socket.Socket) (string, error) {
 
 // envelope 保持所有 socket 事件的返回格式一致。
 func envelope(requestID string, data any, err error) domain.ResponseEnvelope {
+	return envelopeWithErrorCode(requestID, data, err, errorCode)
+}
+
+func workspaceEnvelope(requestID string, data any, err error) domain.ResponseEnvelope {
+	return envelopeWithErrorCode(requestID, data, err, workspaceErrorCode)
+}
+
+func envelopeWithErrorCode(requestID string, data any, err error, codeFor func(error) string) domain.ResponseEnvelope {
 	if err != nil {
 		return domain.ResponseEnvelope{
 			RequestID: requestID,
 			OK:        false,
 			Error: &domain.APIError{
-				Code:    errorCode(err),
+				Code:    codeFor(err),
 				Message: err.Error(),
 			},
 		}
@@ -402,6 +434,13 @@ func envelope(requestID string, data any, err error) domain.ResponseEnvelope {
 	}
 }
 
+func workspaceErrorCode(err error) string {
+	if errors.Is(err, domain.ErrWorktreeNotPrepared) {
+		return "WORKSPACE_NOT_READY"
+	}
+	return errorCode(err)
+}
+
 func errorCode(err error) string {
 	switch {
 	case errors.Is(err, domain.ErrAgentIDRequired):
@@ -410,6 +449,8 @@ func errorCode(err error) string {
 		return "WORKTREE_NOT_PREPARED"
 	case errors.Is(err, domain.ErrInvalidPath), errors.Is(err, domain.ErrPathEscapesWorktree):
 		return "INVALID_PATH"
+	case errors.Is(err, domain.ErrInvalidEdit):
+		return "INVALID_EDIT"
 	case errors.Is(err, domain.ErrVersionConflict):
 		return "VERSION_CONFLICT"
 	case errors.Is(err, domain.ErrExecNotFound):
@@ -425,10 +466,6 @@ func (s *Server) fsServiceWatcher(agentID, subID string) (<-chan watcher.Event, 
 
 func (s *Server) fsServiceWatcherPaths(subID string, paths []string) []string {
 	return s.fsServiceWatcherHub().SetPaths(subID, paths)
-}
-
-func (s *Server) fsServiceUnwatchPaths(subID string, paths []string) {
-	s.fsServiceWatcherHub().RemovePaths(subID, paths)
 }
 
 func (s *Server) fsServiceWatcherHub() *watcher.Hub {
